@@ -1,0 +1,78 @@
+# ============================================================
+# GhostLock X200 — 开源仓库忽略规则
+# 注：不得使用 *.xml / *.html / *.png 通配（会误伤
+#     AndroidManifest.xml / res/ / www/index.html / 图标等关键文件）
+# ============================================================
+
+# ---- 构建产物（不版本化）----
+# 注意：只用 /build/（仓库根，runner 产物），不用裸 build/（会连 exploit/build/
+# 一起忽略，导致 w2host/glt 重建脚本 build_w2host.sh / build_glt_esync.sh 无法提交）
+/build/
+dist/
+dist-online/
+app/build/
+app/build2/
+*.apk
+*.idsig
+*.elf
+*.ko
+*.o
+*.so
+*.tgz
+# exploit/build/ 下仅忽略二进制产物，构建脚本（*.sh）提交
+exploit/build/w2host
+exploit/build/*.elf
+
+# 第三方 jar（shizuku-api 解压产物构建时自重建，只跟踪 .aar）
+*.jar
+vendor/shizuku-api/*_extract/
+
+# ---- payload 资产（从主项目 ghostlock-x200-root 组装，不版本化）----
+payload/
+
+# ---- 机型偏移模块 / 提取中间产物（从主项目 offsets_auto.py 生成）----
+devices/
+psel_work/
+
+# ---- gate 子项目（二进制资产 + 独立构建）----
+gate/assets/
+gate/build/
+
+# ---- 诊断 / 取证 / 发布产物归档（仓库外）----
+diag/
+logs/
+_archives/
+*.log
+*.bak
+*.bak-*
+*.orig*
+*~
+.DS_Store
+
+# ---- 签名密钥（绝不进仓库）----
+*.keystore
+*.jks
+app/ghostlock.keystore
+
+# ---- Shizuku APK / 提取（运行时组件，不版本化）----
+shizuku/
+
+# ---- DSH 技能注入目录（非项目文件）----
+.agents/
+skills-lock.json
+
+# ---- 一次性调试产物（具体文件名，勿用全局通配）----
+ui_dump.xml
+avc_run.log
+bdual_test.log
+cdiag_test.log
+full_stage1.log
+gl6_full.txt
+gl_lock_state.txt
+
+# ---- 旧版前端备份 ----
+app/src/main/assets/www.daisyui.bak-*/
+
+# ---- 运行时 ----
+node_modules/
+ui-preview/

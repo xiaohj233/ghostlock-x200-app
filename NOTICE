@@ -1,0 +1,42 @@
+# NOTICE
+
+GhostLock X200
+Copyright (C) 2026 xiaohj233
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+## 借鉴声明（Acknowledgements）
+
+本项目基于/参考了以下开源项目，均以 Apache-2.0 或兼容许可发布，特此声明：
+
+- **ghostlock-x200-root**（v1.3.5）
+  内核提权链（glt_esync / w2host / 内核模块 / offsets_auto.py 偏移提取器）。
+  runner 的 STAGE 1-7 编排移植自其 `root_full_permissive_restore.ps1`；
+  `exploit/` 下的 glt/w2host 源码复制自该项目并含工作量减量与修复。
+  来源：https://github.com/xiaohj233/ghostlock-x200-root （Apache-2.0）
+
+- **NebuSec / CyberMeowfia — IonStack**（CVE-2026-43499）
+  内核利用原语与竞速思想（Apache-2.0）。
+
+- **YuKongA / ghostlock-app**
+  设备端一键触发 App 的流程设计参考（offsets.json 运行时导入、Shizuku/KernelSU 协作模式）。
+  未直接使用其代码；仅借鉴设计思路（Apache-2.0）。
+
+- **tiann / KernelSU**（v3.2.5）
+  随 payload 分发的内核模块（kernelsu.ko）与 userspace（ksud）。
+  来源：https://github.com/tiann/KernelSU （GPL-3.0，以独立内核模块形式分发）
+
+- **RikkaApps / Shizuku**（13.x）
+  App 通过 Shizuku 授权获得 shell 域进程能力；`vendor/shizuku-api/` 内含其 API 库。
+  来源：https://github.com/RikkaApps/Shizuku （Apache-2.0）
+
+- **Furry-Xiyi / WinUIonWeb**
+  `ui-preview/` 前端使用其 WinUI 风格 Vue 组件库（构建时依赖，未随仓库分发）。
+  来源：https://github.com/Furry-Xiyi/WinUIonWeb
+
+## 分发说明
+
+- `payload/`（glt_esync / w2host / ksud / .ko）为构建期从 ghostlock-x200-root 组装的
+  二进制资产，**不随本仓库分发**；其各自许可见来源项目。
+- KernelSU 内核模块与 ksud 为独立内核组件，按 KernelSU 项目（GPL-3.0）条款分发；
+  本仓库其余代码（App/runner/exploit 源码）按 Apache-2.0。

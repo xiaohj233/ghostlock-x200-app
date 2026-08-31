@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GhostLock X200 启动图标前景（adaptive icon foreground）
+     设计语义：白色幽灵（Ghost）+ 钥匙孔（Lock/解锁），Win11 深色 Mica 风格。
+     幽灵=3 段波浪底；眼睛=背景色镂空；钥匙孔=accent 蓝（#60CDFF）。
+     前景内容保持在 108dp 视口中央 66dp 安全区内，供 launcher 圆形/方形 mask。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 幽灵主体（圆头 + 3 段波浪底） -->
+    <path
+        android:fillColor="#E8EAF0"
+        android:pathData="M54,26 C36,26 26,36 26,54 L26,78
+            c 4.67,-7 14,-7 18.67,0
+            c 4.67,-7 14,-7 18.67,0
+            c 4.67,-7 14,-7 18.67,0
+            L82,54 C82,36 72,26 54,26 Z" />
+
+    <!-- 左眼（背景色镂空） -->
+    <path
+        android:fillColor="#1c1b22"
+        android:pathData="M42,52 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+
+    <!-- 右眼（背景色镂空） -->
+    <path
+        android:fillColor="#1c1b22"
+        android:pathData="M58,52 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+
+    <!-- 钥匙孔圆（accent 蓝） -->
+    <path
+        android:fillColor="#60CDFF"
+        android:pathData="M49.5,59.5 a4.5,4.5 0 1,0 9,0 a4.5,4.5 0 1,0 -9,0 Z" />
+
+    <!-- 钥匙孔三角（accent 蓝，与圆相接成钥匙孔形） -->
+    <path
+        android:fillColor="#60CDFF"
+        android:pathData="M54,63 L51.3,70 L56.7,70 Z" />
+</vector>
