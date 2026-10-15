@@ -4,7 +4,7 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # GhostLock X200 (App)
 
-当前发行版：**1.1.0**（内部版本码 5）。[下载发行版](https://github.com/xiaohj233/ghostlock-x200-app/releases/tag/v1.1.0) · [更新日志](CHANGELOG.md)
+当前发行版：**1.1.0**。[下载发行版](https://github.com/xiaohj233/ghostlock-x200-app/releases/tag/v1.1.0) · [更新日志](CHANGELOG.md)
 
 针对 **vivo X200**、基于 GhostLock（CVE-2026-43499）内核漏洞的**设备端一键 root App**：不刷机、不解锁、不清数据，运行后获得**临时 root**，重启后失效，重新打开 App 一键再 root。
 
