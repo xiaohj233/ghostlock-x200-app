@@ -4,6 +4,8 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # GhostLock X200 (App)
 
+当前发行版：**1.1.0**（内部版本码 5）。[下载发行版](https://github.com/xiaohj233/ghostlock-x200-app/releases/tag/v1.1.0) · [更新日志](CHANGELOG.md)
+
 针对 **vivo X200**、基于 GhostLock（CVE-2026-43499）内核漏洞的**设备端一键 root App**：不刷机、不解锁、不清数据，运行后获得**临时 root**，重启后失效，重新打开 App 一键再 root。
 
 这是 [ghostlock-x200-root](https://github.com/xiaohj233/ghostlock-x200-root)（PC 版工具链）配套的手机端入口，共用同一套提权链。通过 [Shizuku](https://github.com/RikkaApps/Shizuku)（支持无线调试自举）授权后即可使用，**无需电脑 adb**。
@@ -21,10 +23,15 @@ SPDX-License-Identifier: Apache-2.0
 1. 安装并启动 [Shizuku](https://github.com/RikkaApps/Shizuku)（Android 16 需 GitHub 版 13.6.0+）
 2. 打开本 App，按引导授予 Shell 权限
 3. 点击「启动 Root」，等待各阶段完成（约 1-2 分钟）
+   支持自动识别已安装的 KernelSU / SukiSU / ReSukiSU，并使用该版本的管理器加载程序；
+   多个管理器时选择其中一个。详情见 [管理器加载与测试](docs/MANAGER_LOADING.md)。
 4. 验证：终端执行 `su -c id`，应输出 `uid=0(root)`
 5. 重启后 root 失效，重复步骤 1-3
 
 注意：**开机后请先等约 4 分钟再运行**；root 过程中可能触发内核重启（可自动恢复，无变砖风险）。
+
+1.1.0 已知问题：首次完成后，第 9 步可能等待较久并显示验证未通过，但实际功能可能已经可用。
+当前仍保留约 120 秒验证上限，后续将优化结果检测与提示；若实际功能已正常，请先检查管理器状态，避免重复执行完整流程。
 
 ## 构建
 

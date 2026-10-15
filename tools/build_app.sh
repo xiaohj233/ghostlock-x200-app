@@ -11,7 +11,7 @@
 # 用法: bash tools/build_app.sh [SDK_DIR] [device_id]
 #   缺省: SDK_DIR = /root/androidsdk
 #         device_id = x200_b57（对应 payload/<id>/ 与 runner/devices_<id>.h）
-#   产物: app/build/GhostLockX200-v0.1.0.apk（+ unsigned/unaligned 中间产物）
+#   产物: app/build/GhostLockX200-v1.1.0.apk（+ unsigned/unaligned 中间产物）
 # 一致性防线（[1/7] 内执行）:
 #   * payload/<id>/MANIFEST.sha256 存在（先跑 make_payload.sh）
 #   * runner/devices_<id>.h 存在（先跑 build_runner.sh 或 gen_device_header.py）
@@ -29,10 +29,10 @@ PLATFORM="$SDK_DIR/android-35"    # platform-35 android.jar
 
 APP_SRC="$ROOT_DIR/app/src/main"
 BUILD="$ROOT_DIR/app/build"
-OUT_APK="$BUILD/GhostLockX200-v0.1.0.apk"
+OUT_APK="$BUILD/GhostLockX200-v1.1.0.apk"
 
-VERSION_CODE=1
-VERSION_NAME="0.1.0"
+VERSION_CODE=5
+VERSION_NAME="1.1.0"
 PACKAGE="com.ghostlock.x200.app"
 
 # 可选 keystore（缺省自签 dev key）
@@ -139,7 +139,7 @@ SHIZUKU_CP="$ROOT_DIR/vendor/shizuku-api/aar_extract/classes.jar:$ROOT_DIR/vendo
 javac --release 11 \
   -classpath "$PLATFORM/android.jar:$SHIZUKU_CP" \
   -d "$BUILD/classes" \
-  $(find "$APP_SRC/java" -name '*.java') 2>&1 | grep -v "obsolete" || true
+  $(find "$APP_SRC/java" -name '*.java') 2>&1
 echo "  classes: $(find "$BUILD/classes" -name '*.class' | wc -l)"
 
 echo "==> [5/7] d8 → classes.dex"

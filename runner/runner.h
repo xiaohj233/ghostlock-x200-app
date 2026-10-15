@@ -23,6 +23,7 @@ typedef struct {
     const char *tag;       /* 本次运行 tag（时间戳），用于文件命名 */
     const char *bindir;    /* 可执行二进制目录（nativeLibraryDir） */
     const char *ksym_path; /* self-test 用 kallsyms 样例文件 */
+    const char *manager_package; /* NULL = bundled KernelSU; otherwise use installed manager */
     int self_test;         /* 1 = 只跑门禁/解析单测，不触发提权 */
 } RunnerCfg;
 
@@ -50,12 +51,16 @@ void  sleep_ms(int ms);
 int exec_timeout(const char *path, char *const argv[], char *const envp[],
                  const char *log_path, int timeout_s, int *exit_code);
 
-/* kill_all_named：按 /proc/[pid]/stat comm 前缀清杀同 uid 进程（跳过自身）。
- * 用于清 glt/w2host fork 残留（exec_timeout 超时只杀主进程）。 */
-void kill_all_named(const char *prefix);
+/* Match the executable's path/inode, signal its live processes and confirm
+ * exit, including orphaned children. Zombies cannot run and are ignored.
+ * Unverifiable candidates, signal errors or surviving processes => -1. */
+int cleanup_exec(const char *path, int timeout_ms);
+#define RUNNER_CLEANUP_FAILED (-2)
+/* Small per-run journal for crash diagnosis, separate from kernel logs. */
+void runner_event(const RunnerCfg *cfg, const char *event, int result);
 
 /* ---- GL 槽位（gl.c） ---- */
-/* boot_id + 状态文件轮换；跳过 slot 1（宿主有毒）；返回 lock 地址（0x 文本） */
+/* boot_id + 原子状态轮换；跳过 slot 1。持久化成功才返回地址，失败返回 NULL。 */
 const char *gl_lock_next(const char *work, char *buf, size_t bufsz);
 void gl_state_reset(const char *work);          /* permissive_restore 清零宿主后重置 */
 
@@ -106,5 +111,6 @@ int stage4_leak(const RunnerCfg *cfg, char *cands, size_t candsz);
 int stage5_capsroot(const RunnerCfg *cfg, const SymTab *ksym, const char *cands);
 int stage6_insmod(const RunnerCfg *cfg, const SymTab *ksym);
 int stage7_verify(const RunnerCfg *cfg);
+int stage_root_session(const RunnerCfg *cfg); /* existing UID-0 Shizuku: no exploit stages */
 
 #endif /* RUNNER_H */

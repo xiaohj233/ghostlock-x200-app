@@ -16,6 +16,8 @@ package com.ghostlock.x200.app;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
+import java.util.List;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
@@ -138,7 +140,7 @@ public class MainActivity extends Activity {
             o.put("model", android.os.Build.MODEL);
             o.put("kernel", System.getProperty("os.version", ""));
             o.put("android", android.os.Build.VERSION.RELEASE);
-            o.put("root", hasSu());
+            o.put("root", hasSu() || (GhostShizuku.running() && GhostShizuku.granted() && GhostShizuku.uid() == 0));
             o.put("uptimeSec", android.os.SystemClock.elapsedRealtime() / 1000L);
             emit("GhostEnv", o);
         } catch (Exception e) { /* 忽略 */ }
@@ -171,13 +173,14 @@ public class MainActivity extends Activity {
      * runner 找 ko 约定为 work 根目录（stages.c:628-630 work/clear_vr_tag.ko 等）。
      * 机型子目录从 assets/device_id 读取（build_app.sh 写入），缺省回退 x200_b57。
      */
-    private String buildSyncScript() {
+    private String buildSyncScript(RootManager.Asset managerAsset) {
         String apk = getApplicationInfo().sourceDir;
-        return "set -e\n"
+        return "set -e\nexec 2>&1\n"
                 + "D=" + SHELL_WORK + "\n"
                 + "X=$D/.x\n"
                 + "mkdir -p $D\n"
                 + "rm -rf $X; mkdir -p $X\n"
+                + "rm -f $D/ksetup_mark.txt $D/manager_load.status $D/manager_load.log $D/manager_verify.log $D/manager_identity.log $D/manager_help.txt $D/ksud.sha256 $D/ksud.next\n"
                 + "DID=$(unzip -p '" + apk + "' assets/device_id 2>/dev/null || echo x200_b57)\n"
                 + "unzip -o '" + apk + "' 'assets/runner' assets/payload/$DID/* -d $X >/dev/null 2>&1\n"
                 + "mv $X/assets/runner $D/runner\n"
@@ -188,32 +191,87 @@ public class MainActivity extends Activity {
                 + "mv $X/assets/payload/$DID/modules/kernelsu.ko $D/kernelsu.ko\n"
                 + "mv $X/assets/payload/$DID/modules/permissive_restore.ko $D/permissive_restore.ko\n"
                 + "rm -rf $X\n"
+                + (managerAsset == null ? "" : managerAsset.copyScript())
                 + "chmod 755 $D/runner $D/glt_esync $D/w2host $D/ksud\n"
                 + "chmod 644 $D/clear_vr_tag.ko $D/kernelsu.ko $D/permissive_restore.ko\n"
+                + (managerAsset == null ? "" :
+                    "timeout 15 $D/ksud late-load --help > $D/manager_help.txt 2>&1 || { cat $D/manager_help.txt; exit 1; }\n"
+                    + "grep -q -- '--package-name' $D/manager_help.txt || { echo '管理器不支持所需 late-load 接口'; exit 1; }\n"
+                    + "grep -q -- '--allow-shell' $D/manager_help.txt || { echo '管理器不支持 allow-shell'; exit 1; }\n"
+                    + "echo '== 管理器加载程序校验完成 =='\n")
                 + "echo '== payload 同步完成 =='\n"
                 + "ls -la $D\n";
     }
 
     /** runner 启动命令（exec 后 stdout 即 runner 输出，流式可达） */
-    private String buildRunnerCmd() {
+    private String buildRunnerCmd(RootManager manager) {
         String tag = Long.toString(System.currentTimeMillis());
-        return "exec " + SHELL_WORK + "/runner " + SHELL_WORK + " " + tag + " " + SHELL_WORK + "\n";
+        return "exec " + SHELL_WORK + "/runner " + SHELL_WORK + " " + tag + " " + SHELL_WORK
+                + (manager == null ? "" : " --manager " + RootManager.quote(manager.packageName))
+                + " 2>&1\n";
     }
 
     /** 执行 root（Shizuku shell 域全链） */
     private void runRoot() {
-        if (running) return;
-        if (!GhostShizuku.running() || !GhostShizuku.granted()) {
-            emitShizukuState();
-            emitLog("需要 Shizuku 授权（未运行或未授权），请按界面引导操作");
-            return;
-        }
-        running = true;
+        mainHandler.post(() -> {
+            if (running) return;
+            if (!GhostShizuku.running() || !GhostShizuku.granted()) {
+                emitShizukuState();
+                emitDone(false, "需要 Shizuku 运行并授权");
+                return;
+            }
+            running = true;
+            try {
+                List<RootManager> managers = RootManager.installed(this);
+                if (managers.isEmpty()) {
+                    emitLog("未发现受支持的管理器，使用内置 KernelSU");
+                    runRootWithManager(null);
+                } else if (managers.size() == 1) {
+                    runRootWithManager(managers.get(0));
+                } else {
+                    String last = getSharedPreferences(PREF, MODE_PRIVATE)
+                            .getString(RootManager.PREF_PACKAGE, "");
+                    String[] labels = new String[managers.size()];
+                    int[] selected = {0};
+                    for (int i = 0; i < managers.size(); i++) {
+                        labels[i] = managers.get(i).description();
+                        if (managers.get(i).packageName.equals(last)) selected[0] = i;
+                    }
+                    new AlertDialog.Builder(this)
+                            .setTitle("选择已安装的管理器")
+                            .setSingleChoiceItems(labels, selected[0], (dialog, index) -> selected[0] = index)
+                            .setPositiveButton("启动 Root", (dialog, which) -> runRootWithManager(managers.get(selected[0])))
+                            .setNegativeButton("取消", (dialog, which) -> cancelManagerSelection())
+                            .setOnCancelListener(dialog -> cancelManagerSelection())
+                            .show();
+                }
+            } catch (Exception e) {
+                running = false;
+                emitDone(false, "管理器识别失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void cancelManagerSelection() {
+        running = false;
+        emitDone(false, "已取消管理器选择");
+    }
+
+    private void runRootWithManager(RootManager manager) {
         Thread t = new Thread(() -> {
             try {
-                emitLog("== Shizuku shell 域 (uid " + GhostShizuku.uid() + ") ==");
+                RootManager.Asset asset = null;
+                if (manager != null) {
+                    asset = manager.resolve();
+                    getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                            .putString(RootManager.PREF_PACKAGE, manager.packageName).apply();
+                    emitLog("自动识别管理器：" + manager.description() + " / " + manager.packageName);
+                    emitLog("管理器加载程序 SHA-256：" + asset.sha256);
+                }
+                emitLog("== Shizuku 执行身份 uid=" + GhostShizuku.uid() + " ==");
+                emitLog("实际 UID 0 时使用已有 Root，跳过临时提权链");
                 emitLog("== 同步 payload 到 " + SHELL_WORK + " ==");
-                IRemoteProcess sp = GhostShizuku.newProcess(new String[]{"/system/bin/sh", "-c", buildSyncScript()});
+                IRemoteProcess sp = GhostShizuku.newProcess(new String[]{"/system/bin/sh", "-c", buildSyncScript(asset)});
                 readStreamLoop(sp, false);
                 int src = sp.waitFor();
                 if (src != 0) {
@@ -222,13 +280,13 @@ public class MainActivity extends Activity {
                 }
 
                 emitLog("== 启动 runner ==");
-                IRemoteProcess p = GhostShizuku.newProcess(new String[]{"/system/bin/sh", "-c", buildRunnerCmd()});
+                IRemoteProcess p = GhostShizuku.newProcess(new String[]{"/system/bin/sh", "-c", buildRunnerCmd(manager)});
                 readStreamLoop(p, true);
                 int rc = p.waitFor();
                 boolean ok = rc == 0;
                 emitStage(8, ok ? "done" : "fail");
                 emitLog(ok ? "== runner 退出码 0 (成功) ==" : "== runner 退出码 " + rc + " (失败) ==");
-                emitDone(ok, ok ? "Root 成功！" : "Root 失败，详见日志。");
+                emitDone(ok, ok ? (manager == null ? "Root 成功！" : "Root 成功：" + manager.description()) : "Root 失败，详见日志。");
             } catch (Throwable e) {
                 Log.e(TAG, "runRoot 异常", e);
                 emitLog("异常: " + e);
@@ -244,7 +302,7 @@ public class MainActivity extends Activity {
     /**
      * 流式读取 IRemoteProcess 输出（stdout；STAGE 标记驱动进度）。
      * 每行做两件事：①整行推给 JS（GhostLog → 前端日志面板 + 报错分类器）；
-     * ②按 runner 真实日志格式解析「已完成的 UI 阶段数」，单调推进 GhostStage ——
+     * ②按 runner 阶段开始标记解析当前 UI 步骤，单调推进 GhostStage ——
      *   旧实现只认含 PASS 的行，导致执行中途首页永远停在第一阶段，这里改为逐阶段推进。
      */
     private void readStreamLoop(IRemoteProcess p, boolean parseStage) {
@@ -257,39 +315,14 @@ public class MainActivity extends Activity {
                 if (line.isEmpty()) continue;
                 emitLog(line);
                 if (!parseStage) continue;
-                int idx = stageDone(line);
+                int idx = StageProgress.fromLog(line);
                 if (idx > stageIdx) {          // 单调推进：只前进不后退
                     stageIdx = idx;
-                    emitStage(stageIdx, "done");
+                    emitStage(stageIdx, stageIdx == 9 ? "done" : "running");
                 }
             }
         } catch (RemoteException | java.io.IOException e) {
             Log.w(TAG, "读取 runner 输出流失败: " + e);
-        }
-    }
-
-    /**
-     * 解析 runner 一行日志 → 已完成的 UI 阶段数（0..8；与前端 stages 数组对齐：
-     * 0准备 1SELinux 2kptr 3KASLR 4静默 5泄漏 6CAPSROOT 7装内核 8验证）。
-     * 返回 -1 = 该行不推进进度（运行中/失败行由错误横幅承接，结束由 GhostDone 兜底）。
-     */
-    private int stageDone(String line) {
-        if (line.contains("ALL STAGES PASS")) return 8;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("STAGE(\\d+)").matcher(line);
-        if (!m.find()) return -1;
-        int s;
-        try { s = Integer.parseInt(m.group(1)); } catch (NumberFormatException e) { return -1; }
-        boolean ok = line.contains("OK") || line.contains("SKIP");
-        if (!ok) return -1;
-        switch (s) {
-            case 1: return 1;                    // SELinux 完成
-            case 2: return 2;                    // kptr 完成
-            case 3: return 3;                    // KASLR 完成
-            case 4: return line.contains("candidate") ? 5 : (line.contains("quiesced") ? 4 : -1);
-            case 5: return 6;                    // CAPSROOT 完成
-            case 6: return 7;                    // 装内核 完成
-            case 7: return 8;                    // 验证 完成
-            default: return -1;
         }
     }
 

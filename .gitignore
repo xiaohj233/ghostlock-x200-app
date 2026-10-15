@@ -8,6 +8,7 @@
 # 注意：只用 /build/（仓库根，runner 产物），不用裸 build/（会连 exploit/build/
 # 一起忽略，导致 w2host/glt 重建脚本 build_w2host.sh / build_glt_esync.sh 无法提交）
 /build/
+/work/
 dist/
 dist-online/
 app/build/

